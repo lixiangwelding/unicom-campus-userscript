@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         联通党校-刷课助手
 // @namespace    codex.local/unicom-campus-personal
-// @version      1.2.2
+// @version      1.2.3
 // @description  联通党校专题课程助手，支持功能预览、新手教程、断点续跑与进度展示；使用功能需激活，每码支持4个浏览器。
 // @author       Personal
+// @antifeature  payment 课程任务功能需有效授权码，每码最多绑定4个浏览器。
+// @antifeature  tracking 向授权服务上报随机浏览器编号、页面会话编号、脚本版本与任务运行状态，用于最近5分钟使用数量及24小时趋势统计；不上传账号密码、Cookie或课程内容。
 // @match        *://*.campus.chinaunicom.cn/*
 // @match        *://campus.chinaunicom.cn/*
 // @require      https://cdn.jsdelivr.net/npm/jsencrypt@2.3.1/bin/jsencrypt.min.js
@@ -24,7 +26,7 @@
 const LICENSE_CONFIG = {
   "apiBase": "https://license.ddtgm.cn",
   "shopUrl": "https://wzyp.cn/shop/2U92NO5U/nh6hd3",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "shopQrDataUrl": "data:image/png;base64,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"
 };
 function createCourseDashboard(host) {
@@ -409,7 +411,7 @@ const GM_xmlhttpRequest = licenseGate.request;
 (function () {
   'use strict';
 
-  const VERSION = '1.2.2';
+  const VERSION = '1.2.3';
   const API = {
     list: 'https://campus.chinaunicom.cn/training/app/themeColumn/getMyAreaInfoCourse',
     info: 'https://campus.chinaunicom.cn/training/app/course/info',
