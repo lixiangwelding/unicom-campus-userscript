@@ -4,17 +4,39 @@
 
 把课程汇总、专题选择、课程多选和进度回读放在一个面板里。默认宽屏高密度展示，也可切换小卡片。
 
-## 真实运行截图
+## v1.3.3 真实运行截图
 
-以下图片来自 v1.3.2 自用测试环境的真实党校页面。公开版仍需激活码。图片中的课程数量与进度是当时实际读取值；示例仅汇总一个推荐专题，不代表全站所有课程已经完成。
+以下五张图片均于2026-10-23在已登录的真实党校页面拍摄，运行版本为v1.3.3个人自用测试版，公开授权版仍需激活码。截图仅截取助手区域，未包含账号栏。课程与进度为该账号当时可访问范围；没有用演示数据替代真实结果。
 
-### 推荐专题、真实汇总和四类图表
+### 全量汇总 · 15 个来源、8546 门去重课程
 
-![真实党校推荐专题汇总与四类图表](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/overview-real-v1.3.2.jpg)
+![v1.3.3 全量汇总 · 15 个来源、8546 门去重课程](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/overview-real-v1.3.3.jpg)
 
-### 筛选推荐课程并多选
+课程中心696页与当前首页已发现的14个专题汇总完成。15/15为来源扫描成功；8546为唯一课程ID，8717为跨来源关联数，均不代表已经学完。
 
-![真实党校推荐来源筛选与两门课程多选](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/multiselect-real-v1.3.2.jpg)
+### 四类图表 · 整体状态、分类、来源完成率、进度区间
+
+![v1.3.3 四类图表 · 整体状态、分类、来源完成率、进度区间](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/charts-real-v1.3.3.jpg)
+
+真实读取结果：5门官方已完成、192门官方已确认待学、8349门官方进度未知。接口未提供分类时显示“未标注”；缺失进度保留未知，图表不编造状态。
+
+### 专题来源筛选 · 推荐与轮播课程
+
+![v1.3.3 专题来源筛选 · 推荐与轮播课程](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/filter-real-v1.3.3.jpg)
+
+界面“推荐专题”筛选项汇集已发现专题课程（包含轮播专题），本次匹配367条，最多展示前200条。搜索和筛选不会改变“一键刷全部”的执行范围；切换筛选仍保留已选两门。
+
+### 具体专题 · 筛出两门课程并多选
+
+![v1.3.3 具体专题 · 筛出两门课程并多选](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/multiselect-real-v1.3.3.jpg)
+
+选中“树立和践行正确政绩观”专题，两门课程均已勾选。明细显示所属来源、详情回读时间和章节时长。章节时长比例与官方课程完成率分开显示。暂停队列保留期间，选择控件锁定；继续原队列或重新汇总后选择。
+
+### 真实运行 · 当前章节、时长与服务端回读
+
+![v1.3.3 真实运行 · 当前章节、时长与服务端回读](https://raw.githubusercontent.com/lixiangwelding/unicom-campus-userscript/master/marketing/progress-real-v1.3.3.jpg)
+
+本次只执行已选两门：截图时当前章节39.0%，已学17:30/44:35；本轮提交成功5次、失败0次，服务端抽样回读3/3。等待下轮期间截图，随后已安全停止。这些计数不是全站完成数量。
 
 ## 可以怎样使用
 
