@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         联通党校-刷课助手
 // @namespace    codex.local/unicom-campus-personal
-// @version      1.3.2
+// @version      1.3.3
 // @description  联通党校专题课程助手，支持功能预览、新手教程、断点续跑与进度展示；使用功能需激活，每码支持4个浏览器。
 // @author       Personal
 // @match        *://*.campus.chinaunicom.cn/*
@@ -24,7 +24,7 @@
 const LICENSE_CONFIG = {
   "apiBase": "https://license.ddtgm.cn",
   "shopUrl": "https://wzyp.cn/shop/2U92NO5U/nh6hd3",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "tutorialScreenshots": [
     {
       "title": "1. 选择全量汇总或专题优先",
@@ -478,7 +478,7 @@ function createHomeOverview(host, options = {}) {
     for (const [key, label, color] of [['completed', '已完成', '#a22039'], ['pending', '待学', '#d49bab'], ['unknown', '未知', '#c9c3c7']]) {
       const segment = element('span', ''); segment.style.width = `${data.rows.length ? counts[key] / data.rows.length * 100 : 0}%`; segment.style.background = color; segment.title = `${label} ${counts[key]} 门`; bar.append(segment);
     }
-    distribution.append(bar, element('div', `已扫描去重课程 ${data.rows.length} 门：已完成 ${counts.completed} · 待学 ${counts.pending} · 未知 ${counts.unknown}`, 'ucl-home-note'), element('p', '缺失进度会读取课程详情补齐；仍缺失时明细会显示原因。统计仅含成功汇总的课程，不将未知进度视为 0%。', 'ucl-home-note'));
+    distribution.append(bar, element('div', `已扫描去重课程 ${data.rows.length} 门：已完成 ${counts.completed} · 待学 ${counts.pending} · 未知 ${counts.unknown}`, 'ucl-home-note'), element('p', '专题缺失进度会读取详情补齐；课程中心先展示列表，开始所选课程前再读取详情确认。仍缺失时明细显示原因，未知进度不视为 0%。', 'ucl-home-note'));
     root.append(distribution);
     const wrap = element('div', '', 'ucl-home-table');
     if (!topics.size) wrap.append(element('div', '当前页面没有已加载的专题入口，请先打开首页的学习专题列表。', 'ucl-home-empty'));
@@ -898,7 +898,7 @@ const GM_xmlhttpRequest = licenseGate.request;
 (function () {
   'use strict';
 
-  const VERSION = '1.3.2';
+  const VERSION = '1.3.3';
   const API = {
     list: 'https://campus.chinaunicom.cn/training/app/themeColumn/getMyAreaInfoCourse',
     info: 'https://campus.chinaunicom.cn/training/app/course/info',
@@ -1138,7 +1138,16 @@ const GM_xmlhttpRequest = licenseGate.request;
         homeOverview.updateTopic(topic.id, { status: 'loading', courses: null, total: null, completed: null, pending: null });
         try {
           assertOverviewSession();
-          const courses = await fillOverviewProgress((await fetchOverviewCourses(topic)).map(course => ({...normalizeOverviewCourse(course), progressReadAt: Date.now()})));
+          let courses = (await fetchOverviewCourses(topic)).map(course => ({...normalizeOverviewCourse(course), progressReadAt: Date.now()}));
+          if (topic.id === 'catalog-all') {
+            // The catalog may omit progress for every course. Reading thousands
+            // of details here hides a complete list behind hours of extra I/O.
+            // Selected task preparation already reads details before any write.
+            for (const course of courses) if (course.progress === null) {
+              course.progressReadSource = '课程中心列表';
+              course.progressReadError = '列表未返回官方进度；开始所选课程前会读取详情确认';
+            }
+          } else courses = await fillOverviewProgress(courses);
           assertOverviewSession();
           const completed = courses.filter(isCourseFinished).length;
           homeOverview.updateTopic(topic.id, { status: 'success', courses, total: courses.length, completed, pending: courses.length - completed });
@@ -2172,6 +2181,7 @@ const GM_xmlhttpRequest = licenseGate.request;
       @media (max-width:600px) { #ucp-panel { top:auto!important; right:10px!important; bottom:10px; left:10px!important; width:auto; } #ucp-body { max-height:68dvh; overflow:auto; } #ucp-launcher { top:auto; right:10px; bottom:12px; } }
       @media (prefers-reduced-motion:reduce) { #ucp-panel *, #ucp-launcher { scroll-behavior:auto!important; transition:none!important; animation:none!important; } }
     `;
+    style.textContent += '#ucp-topic-actions{margin:0 0 14px;padding:14px;border:1px solid #e9c4ce;border-radius:14px;background:#fff6f8}#ucp-topic-actions p{margin:0 0 10px;color:#8b243a;font-size:12px;font-weight:650}#ucp-topic-actions .ucp-primary,#ucp-topic-actions .ucp-danger{min-height:54px;font-size:17px;font-weight:750}';
     document.head.appendChild(style);
   }
 
@@ -2242,6 +2252,19 @@ const GM_xmlhttpRequest = licenseGate.request;
           </details>
         </div>
       </div>`;
+    if (themeIdFromUrl()) {
+      const actions = document.createElement('section');
+      actions.id = 'ucp-topic-actions';
+      actions.setAttribute('aria-label', '当前专题快捷操作');
+      const scope = document.createElement('p');
+      scope.textContent = '当前专题 · 仅处理本专题待学课程';
+      const start = panel.querySelector('[data-action="start"]');
+      start.textContent = '▶ 一键开始刷当前专题';
+      const stop = panel.querySelector('[data-action="stop"]');
+      stop.textContent = '停止当前专题';
+      actions.append(scope, start, stop);
+      panel.querySelector('#ucp-body').prepend(actions);
+    }
     const launcher = document.createElement('button');
     launcher.id = 'ucp-launcher';
     launcher.textContent = '刷课助手';
