@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         联通党校-刷课助手
 // @namespace    codex.local/unicom-campus-personal
-// @version      1.3.3
+// @version      1.4.0
 // @description  联通党校专题课程助手，支持功能预览、新手教程、断点续跑与进度展示；使用功能需激活，每码支持4个浏览器。
 // @author       Personal
 // @match        *://*.campus.chinaunicom.cn/*
@@ -15,6 +15,8 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @run-at       document-idle
+// @downloadURL  https://license.ddtgm.cn/unicom-campus.user.js
+// @updateURL    https://license.ddtgm.cn/unicom-campus.meta.js
 // @antifeature  payment 完整课程功能需要购买激活码；每码最多4个浏览器，预览与教程可免费查看。
 // @antifeature  tracking 向授权服务上报激活码、随机浏览器编号、页面会话编号、脚本版本与任务运行状态，用于使用数量及趋势统计；不上传账号密码、Cookie或课程内容。
 // ==/UserScript==
@@ -24,7 +26,7 @@
 const LICENSE_CONFIG = {
   "apiBase": "https://license.ddtgm.cn",
   "shopUrl": "https://wzyp.cn/shop/2U92NO5U/nh6hd3",
-  "version": "1.3.3",
+  "version": "1.4.0",
   "tutorialScreenshots": [
     {
       "title": "1. 选择全量汇总或专题优先",
@@ -669,6 +671,529 @@ function createLicenseView(config) {
   };
 }
 
+// Local-only study history and favourites.
+//
+// Design constraints (see docs/project/backend/unicom-license/script-release.md):
+// - Never touches the license gate, network, or the task engine. If any of this
+//   throws, the learning flow must continue untouched.
+// - Uses the same GM storage the script already holds grants for, under keys
+//   that are NOT part of the release contract (userscript-contract.json), so a
+//   bump here can never invalidate a saved activation.
+// - All data stays on the user's machine; nothing is uploaded.
+function createStudyJournal(config, native) {
+  // Deliberately outside the contract's `uc-license-v1-*` namespace.
+  const KEYS = {
+    history: 'uc-study-v1-history',
+    favorites: 'uc-study-v1-favorites',
+    settings: 'uc-study-v1-settings',
+  };
+  const HISTORY_LIMIT = 500;
+  const FAVORITE_LIMIT = 300;
+
+  const read = (key, fallback) => {
+    try {
+      const raw = native.get(key, '');
+      if (!raw) return fallback;
+      const value = JSON.parse(raw);
+      return value === null || value === undefined ? fallback : value;
+    } catch { return fallback; }
+  };
+  const write = (key, value) => {
+    try {
+      native.set(key, JSON.stringify(value));
+      return true;
+    } catch { return false; }
+  };
+
+  let history = read(KEYS.history, []);
+  let favorites = read(KEYS.favorites, []);
+  let settings = read(KEYS.settings, {});
+  if (!Array.isArray(history)) history = [];
+  if (!Array.isArray(favorites)) favorites = [];
+  if (!settings || typeof settings !== 'object') settings = {};
+
+  function sanitizeId(rawId) {
+    if (rawId === null || rawId === undefined) return '';
+    const id = String(rawId).trim();
+    // Course ids are short opaque tokens; reject anything that could smuggle
+    // markup or a second record through the storage layer.
+    return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : '';
+  }
+
+  // A run is recorded only when it actually carried learning work. Opening the
+  // panel or scanning the catalogue is not study time.
+  function recordRun(entry = {}) {
+    try {
+      const id = sanitizeId(entry.courseId);
+      if (!id) return false;
+      const startedAt = Number(entry.startedAt) || Date.now();
+      const endedAt = Math.max(startedAt, Number(entry.endedAt) || Date.now());
+      const duration = Math.max(0, Math.min(endedAt - startedAt, 12 * 60 * 60 * 1000));
+      history.unshift({
+        courseId: id,
+        title: typeof entry.title === 'string' ? entry.title.slice(0, 200) : '',
+        topicId: sanitizeId(entry.topicId),
+        topicTitle: typeof entry.topicTitle === 'string' ? entry.topicTitle.slice(0, 200) : '',
+        startedAt, endedAt, duration,
+        completed: entry.completed === true,
+        version: typeof config?.version === 'string' ? config.version : '',
+      });
+      if (history.length > HISTORY_LIMIT) history.length = HISTORY_LIMIT;
+      write(KEYS.history, history);
+      return true;
+    } catch { return false; }
+  }
+
+  function isFavorite(courseId) {
+    const id = sanitizeId(courseId);
+    return Boolean(id) && favorites.includes(id);
+  }
+
+  function toggleFavorite(courseId) {
+    try {
+      const id = sanitizeId(courseId);
+      if (!id) return { ok: false, favorite: false };
+      const at = favorites.indexOf(id);
+      if (at >= 0) favorites.splice(at, 1);
+      else {
+        favorites.unshift(id);
+        if (favorites.length > FAVORITE_LIMIT) favorites.length = FAVORITE_LIMIT;
+      }
+      favorites = favorites.filter(value => sanitizeId(value));
+      write(KEYS.favorites, favorites);
+      return { ok: true, favorite: at < 0 };
+    } catch { return { ok: false, favorite: isFavorite(courseId) }; }
+  }
+
+  // Aggregates are derived on read so the stored history stays a flat log that
+  // survives schema tweaks without a migration.
+  function summary(now = Date.now()) {
+    try {
+      // One clock for every bucket: "today" and the per-day trend must agree,
+      // or a run can count toward the 7-day total while belonging to no bar.
+      // A local calendar day is what the user sees, so day keys are local too.
+      const dayStart = new Date(now); dayStart.setHours(0, 0, 0, 0);
+      const dayKey = value => {
+        const date = new Date(value);
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+      };
+      const weekStart = now - 7 * 24 * 60 * 60 * 1000;
+      let todayMs = 0, weekMs = 0, totalMs = 0, completed = 0;
+      const byCourse = new Map(), byDay = new Map();
+      for (const item of history) {
+        const duration = Number(item.duration) || 0;
+        totalMs += duration;
+        // Runs in the future are clamped out of "today" and "this week" rather
+        // than silently inflating them, but still count toward the total.
+        const startedAt = Number(item.startedAt);
+        const at = Number.isFinite(startedAt) ? startedAt : now;
+        if (at >= dayStart.getTime() && at <= now) todayMs += duration;
+        if (at >= weekStart && at <= now) weekMs += duration;
+        if (item.completed) completed++;
+        const id = sanitizeId(item.courseId);
+        if (id) byCourse.set(id, (byCourse.get(id) || 0) + duration);
+        byDay.set(dayKey(at), (byDay.get(dayKey(at)) || 0) + duration);
+      }
+      const topCourses = [...byCourse.entries()]
+        .sort((a, b) => b[1] - a[1]).slice(0, 8)
+        .map(([courseId, duration]) => ({
+          courseId, duration,
+          title: history.find(item => sanitizeId(item.courseId) === courseId)?.title || '',
+        }));
+      return {
+        runs: history.length, totalMs, todayMs, weekMs, completed,
+        favorites: favorites.length,
+        topCourses,
+        byDay: [...byDay.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1).slice(-14),
+      };
+    } catch {
+      return { runs: 0, totalMs: 0, todayMs: 0, weekMs: 0, completed: 0, favorites: 0, topCourses: [], byDay: [] };
+    }
+  }
+
+  // CSV is built by hand: this runs in a userscript where Blob/URL exist, but
+  // escaping must not depend on cell content being trusted.
+  function toCsv() {
+    try {
+      const escape = value => {
+        const text = String(value ?? '');
+        return /[",\n\r]/.test(text) ? '"' + text.replaceAll('"', '""') + '"' : text;
+      };
+      const rows = [['课程ID', '课程名', '专题', '开始时间', '结束时间', '时长(分钟)', '是否完成', '脚本版本']];
+      for (const item of history) {
+        rows.push([
+          item.courseId, item.title, item.topicTitle,
+          new Date(item.startedAt).toISOString(),
+          new Date(item.endedAt).toISOString(),
+          (Math.round((Number(item.duration) || 0) / 6000) / 10).toFixed(1),
+          item.completed ? '是' : '否',
+          item.version,
+        ]);
+      }
+      return rows.map(row => row.map(escape).join(',')).join('\r\n') + '\r\n';
+    } catch { return ''; }
+  }
+
+  // Reports the persistence result rather than the in-memory one: a failed
+  // write would otherwise look like a successful wipe until the next reload.
+  function clearHistory() {
+    try {
+      history = [];
+      return write(KEYS.history, history);
+    } catch { return false; }
+  }
+
+  function getSettings() { return { ...settings }; }
+  function setSettings(patch) {
+    try {
+      settings = { ...settings, ...patch };
+      write(KEYS.settings, settings);
+      return { ...settings };
+    } catch { return { ...settings }; }
+  }
+
+  return {
+    recordRun, isFavorite, toggleFavorite, summary, toCsv, clearHistory,
+    getSettings, setSettings,
+    get favorites() { return [...favorites]; },
+    get history() { return history.map(item => ({ ...item })); },
+  };
+}
+
+// Study-time visuals built from the local journal.
+//
+// Mirrors the conventions of overview-charts.js: hand-drawn SVG, the same ink
+// and accent palette, explicit "unknown" handling instead of invented zeros.
+// Everything here is local; there is no network call and no licence coupling.
+function createStudyCharts(doc, { summary = null } = {}) {
+  const colors = { bar: '#a32642', barSoft: '#d8a9b7', ink: '#40323a', muted: '#88717e', grid: '#eee6ea' };
+  const root = doc.createElement('section');
+  root.className = 'ucl-study-charts';
+  root.setAttribute('aria-label', '学习时长图表');
+  const text = (tag, value, className) => {
+    const el = doc.createElement(tag);
+    if (value !== undefined && value !== null) el.textContent = value;
+    if (className) el.className = className;
+    return el;
+  };
+  const svgNode = (tag, attributes = {}, value) => {
+    const el = doc.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [key, val] of Object.entries(attributes)) el.setAttribute(key, String(val));
+    if (value !== undefined) el.textContent = value;
+    return el;
+  };
+
+  const style = text('style', `.ucl-study-charts{margin:14px 0;color:${colors.ink};min-width:0}.ucl-study-charts *{box-sizing:border-box}.usc-note{font-size:11px;line-height:1.7;color:${colors.muted};margin:0 0 10px}.usc-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}.usc-col{display:grid;gap:12px;align-content:start;min-width:0}.usc-card{background:#fff;border:1px solid #eadfe5;border-radius:12px;padding:14px;min-width:0}.usc-card h4{font-size:13px;margin:0 0 10px;color:#59404e}.usc-empty{font-size:11px;color:${colors.muted};padding:22px 2px;line-height:1.7}.usc-kpi{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.usc-kpi div{background:#fbf7f9;border-radius:9px;padding:9px 10px}.usc-kpi strong{display:block;font-size:17px;line-height:1.3;font-variant-numeric:tabular-nums;color:${colors.bar}}.usc-kpi small{font-size:10px;color:${colors.muted}}.usc-bars{max-height:none;overflow:visible}.usc-bar-row{margin-bottom:9px}.usc-bar-label{display:flex;justify-content:space-between;gap:10px;font-size:10px;line-height:1.6;margin-bottom:3px}.usc-bar-label span:first-child{overflow-wrap:anywhere;min-width:0}.usc-bar-label span:last-child{white-space:nowrap;font-variant-numeric:tabular-nums;color:${colors.muted}}.usc-track{height:7px;border-radius:7px;background:#f2edf0;overflow:hidden}.usc-fill{display:block;height:100%;border-radius:7px;background:${colors.bar}}.usc-svg{width:100%;height:auto;max-height:170px;display:block}.usc-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.usc-actions button{border:1px solid #d7b5c1;background:#fff;color:#8b243a;border-radius:8px;padding:7px 11px;font-size:11px;cursor:pointer}.usc-actions button:disabled{opacity:.5;cursor:default}.usc-actions button.usc-danger{color:#8a2b3c;border-color:#e0bfc7}@media(max-width:760px){.usc-grid{grid-template-columns:1fr}}@media(prefers-reduced-motion:no-preference){.usc-fill{transition:width 160ms ease-out}}`);
+  root.append(style);
+
+  const minutes = ms => Math.round((Number(ms) || 0) / 6000) / 10;
+  const hoursText = ms => {
+    const total = minutes(ms);
+    if (total < 60) return total.toFixed(total < 10 ? 1 : 0) + ' 分';
+    return (total / 60).toFixed(1) + ' 时';
+  };
+  const data = summary && typeof summary === 'object' ? summary : null;
+  const byDay = Array.isArray(data?.byDay) ? data.byDay : [];
+  const topCourses = Array.isArray(data?.topCourses) ? data.topCourses : [];
+
+  const empty = (el, message) => el.append(text('div', message, 'usc-empty'));
+
+  // Two independent columns rather than a 2-column grid: grid rows reserve the
+  // tallest cell, which left a hole under the short totals card. Each column
+  // stacks its own cards at natural height.
+  const grid = text('div', '', 'usc-grid');
+  const leftColumn = text('div', '', 'usc-col');
+  const rightColumn = text('div', '', 'usc-col');
+  grid.append(leftColumn, rightColumn);
+  root.append(grid);
+  const columnOf = { totals: leftColumn, trend: rightColumn, ranking: leftColumn, outcomes: rightColumn };
+  const card = (title, key) => {
+    const el = text('section', '', 'usc-card');
+    el.dataset.chart = key;
+    el.append(text('h4', title));
+    (columnOf[key] || leftColumn).append(el);
+    return el;
+  };
+
+  // 1. Totals. Unknown stays unknown: a missing journal is not a zero-hour day.
+  const totals = card('学习时长总览', 'totals');
+  if (!data || !data.runs) {
+    empty(totals, '还没有学习记录。开始一次刷课后，这里会按天累计时长（只保存在本机）。');
+  } else {
+    const kpi = text('div', '', 'usc-kpi');
+    for (const [label, value] of [['今日', data.todayMs], ['近 7 天', data.weekMs], ['累计', data.totalMs]]) {
+      const cell = text('div');
+      cell.append(text('strong', hoursText(value)), text('small', label));
+      kpi.append(cell);
+    }
+    totals.append(kpi);
+    totals.append(text('p', `共 ${data.runs} 次运行，完成 ${data.completed} 门；收藏 ${data.favorites} 门。`, 'usc-note'));
+  }
+
+  // 2. Daily trend. One bar per day present in the log; gaps are not filled
+  //    with zero, because a day with no run is not a measured zero.
+  const trend = card('每日学习时长', 'trend');
+  if (byDay.length < 2) {
+    empty(trend, byDay.length ? '只有一天的数据，再积累几天就能看到趋势。' : '暂无按天数据。');
+  } else {
+    const width = 320, height = 120, padX = 6, padY = 14;
+    const max = Math.max(...byDay.map(([, ms]) => Number(ms) || 0), 1);
+    const slot = (width - padX * 2) / byDay.length;
+    const barWidth = Math.max(2, Math.min(24, slot * 0.62));
+    const svg = svgNode('svg', {
+      class: 'usc-svg', viewBox: `0 0 ${width} ${height}`, role: 'img',
+      'aria-label': `最近 ${byDay.length} 天每天的学习时长`,
+    });
+    svg.append(svgNode('line', { x1: padX, y1: height - padY, x2: width - padX, y2: height - padY, stroke: colors.grid, 'stroke-width': 1 }));
+    byDay.forEach(([day, ms], index) => {
+      const value = Number(ms) || 0;
+      const barHeight = Math.max(value > 0 ? 2 : 0, (value / max) * (height - padY * 2));
+      const x = padX + index * slot + (slot - barWidth) / 2;
+      const bar = svgNode('rect', {
+        x: x.toFixed(1), y: (height - padY - barHeight).toFixed(1),
+        width: barWidth.toFixed(1), height: barHeight.toFixed(1),
+        rx: 2, fill: value > 0 ? colors.bar : colors.barSoft,
+      });
+      const title = svgNode('title', {}, `${day}：${hoursText(value)}`);
+      bar.append(title);
+      svg.append(bar);
+    });
+    trend.append(svg);
+    trend.append(text('p', `${byDay[0][0]} 起，共 ${byDay.length} 个有记录的日子；无记录的日子不按 0 计入。`, 'usc-note'));
+  }
+
+  // 3. Most-invested courses.
+  const ranking = card('投入最多的课程', 'ranking');
+  if (!topCourses.length) {
+    empty(ranking, '暂无课程时长排名。');
+  } else {
+    const max = Math.max(...topCourses.map(row => Number(row.duration) || 0), 1);
+    const bars = text('div', '', 'usc-bars');
+    for (const row of topCourses) {
+      const value = Number(row.duration) || 0;
+      const wrap = text('div', '', 'usc-bar-row');
+      const label = text('div', '', 'usc-bar-label');
+      const name = text('span', row.title || row.courseId || '未命名课程');
+      label.append(name, text('span', hoursText(value)));
+      const track = text('div', '', 'usc-track');
+      const fill = text('i', '', 'usc-fill');
+      fill.style.width = Math.max(value > 0 ? 2 : 0, (value / max) * 100).toFixed(1) + '%';
+      track.append(fill);
+      wrap.append(label, track);
+      bars.append(wrap);
+    }
+    ranking.append(bars);
+  }
+
+  // 4. Session outcomes: completed vs unfinished runs, derived from the log.
+  const outcomes = card('运行结果', 'outcomes');
+  if (!data || !data.runs) {
+    empty(outcomes, '暂无运行结果。');
+  } else {
+    const completed = Math.max(0, Number(data.completed) || 0);
+    const other = Math.max(0, (Number(data.runs) || 0) - completed);
+    const total = completed + other || 1;
+    const ringSize = 96, radius = 38, circumference = 2 * Math.PI * radius;
+    const svg = svgNode('svg', { class: 'usc-svg', viewBox: `0 0 ${ringSize} ${ringSize}`, role: 'img', 'aria-label': '已完成与未完成的运行次数' });
+    svg.append(svgNode('circle', { cx: ringSize / 2, cy: ringSize / 2, r: radius, fill: 'none', stroke: colors.grid, 'stroke-width': 11 }));
+    const done = svgNode('circle', {
+      cx: ringSize / 2, cy: ringSize / 2, r: radius, fill: 'none', stroke: colors.bar,
+      'stroke-width': 11, 'stroke-linecap': 'round',
+      'stroke-dasharray': `${(completed / total) * circumference} ${circumference}`,
+      transform: `rotate(-90 ${ringSize / 2} ${ringSize / 2})`,
+    });
+    svg.append(done);
+    svg.append(svgNode('text', {
+      x: ringSize / 2, y: ringSize / 2 + 5, 'text-anchor': 'middle',
+      'font-size': 17, 'font-weight': 700, fill: colors.bar,
+    }, String(completed)));
+    outcomes.append(svg);
+    outcomes.append(text('p', `已完成 ${completed} 次，未完成 ${other} 次（共 ${data.runs} 次运行）。`, 'usc-note'));
+  }
+
+  return { root };
+}
+
+// Study panel: history list, favourites and CSV export.
+//
+// Mounted beside the overview. Every entry point is wrapped so a failure here
+// can only hide this panel; it can never stop a learning run, the licence gate
+// or the existing overview.
+function createStudyPanel(doc, { journal, charts, onPickCourse } = {}) {
+  const text = (tag, value, className) => {
+    const el = doc.createElement(tag);
+    if (value !== undefined && value !== null) el.textContent = value;
+    if (className) el.className = className;
+    return el;
+  };
+  const root = text('section', '', 'ucl-study');
+
+  const style = text('style', `.ucl-study{color:#40323a;min-width:0;font:inherit}.ucl-study *{box-sizing:border-box}.ucl-study h3{font-size:16px;margin:0 0 4px}.ucl-study .ust-note{font-size:11px;line-height:1.7;color:#88717e;margin:0 0 12px}.ust-toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}.ust-toolbar button,.ust-toolbar select{border:1px solid #d7b5c1;background:#fff;color:#8b243a;border-radius:8px;padding:7px 11px;font-size:11px;cursor:pointer}.ust-toolbar button:disabled{opacity:.45;cursor:default}.ust-toolbar button.ust-primary{background:#a22039;color:#fff;border-color:#a22039}.ust-list{border:1px solid #ece5e9;border-radius:10px;overflow:auto;max-height:300px}.ust-row{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-top:1px solid #f2ecf0;font-size:12px}.ust-row:first-child{border-top:0}.ust-row:hover{background:#fcf8fa}.ust-main{flex:1;min-width:0}.ust-title{font-weight:600;overflow-wrap:anywhere}.ust-meta{font-size:10px;color:#88717e;margin-top:3px;font-variant-numeric:tabular-nums}.ust-star{border:0;background:none;cursor:pointer;font-size:16px;line-height:1;padding:2px 4px;color:#c9b3bd;flex-shrink:0}.ust-star[aria-pressed="true"]{color:#a22039}.ust-empty{padding:20px 14px;color:#88717e;font-size:12px}.ust-badge{display:inline-block;font-size:9px;border-radius:4px;padding:1px 5px;margin-left:6px;background:#f0e7eb;color:#7c5a68;vertical-align:middle}.ust-badge.ust-done{background:#eaf3ed;color:#3f7051}.ucl-study-charts-host{margin-top:12px}.ucl-study-tabs{display:flex;gap:14px;border-bottom:1px solid #ece5e9;margin:0 0 10px}.ucl-study-tabs button{border:0;background:none;padding:7px 0 9px;font-size:12px;font-weight:600;color:#88717e;border-bottom:2px solid transparent;cursor:pointer}.ucl-study-tabs button[aria-selected="true"]{color:#a22039;border-color:#a22039}@media(max-width:650px){.ust-row{padding:9px 10px}.ust-toolbar button{flex:1}}`);
+
+  root.append(style, text('h3', '学习记录'), text('p', '只保存在本机浏览器，不上传；清除浏览器数据会一并删除。', 'ust-note'));
+
+  const tabs = text('div', '', 'ucl-study-tabs');
+  const chartsHost = text('div', '', 'ucl-study-charts-host');
+  const listView = text('div');
+  const chartsView = text('div');
+  for (const [key, label] of [['history', '运行记录'], ['charts', '学习趋势']]) {
+    const button = text('button', label);
+    button.type = 'button';
+    button.setAttribute('role', 'tab');
+    button.dataset.studyTab = key;
+    button.addEventListener('click', () => select(key));
+    tabs.append(button);
+  }
+  root.append(tabs, listView, chartsView);
+
+  const toolbar = text('div', '', 'ust-toolbar');
+  const filterLabel = text('label', '筛选');
+  filterLabel.htmlFor = 'ust-filter';
+  const filter = text('select');
+  filter.id = 'ust-filter';
+  for (const [value, label] of [['all', '全部'], ['favorites', '只看收藏'], ['completed', '只看已完成']]) {
+    const option = text('option', label);
+    option.value = value;
+    filter.append(option);
+  }
+  filterLabel.append(filter);
+  const exportButton = text('button', '导出 CSV', 'ust-primary');
+  exportButton.type = 'button';
+  exportButton.dataset.studyAction = 'export';
+  const clearButton = text('button', '清除记录');
+  clearButton.type = 'button';
+  clearButton.dataset.studyAction = 'clear';
+  toolbar.append(filterLabel, exportButton, clearButton);
+  listView.append(toolbar);
+
+  const list = text('div', '', 'ust-list');
+  listView.append(list);
+
+  let activeTab = 'history';
+  let activeFilter = 'all';
+
+  function select(tab) {
+    activeTab = tab;
+    for (const button of tabs.querySelectorAll('[data-study-tab]')) {
+      button.setAttribute('aria-selected', String(button.dataset.studyTab === tab));
+    }
+    listView.hidden = tab !== 'history';
+    chartsView.hidden = tab !== 'charts';
+    // Charts are drawn lazily on first reveal; keeping them out of the initial
+    // render avoids measuring SVG in a hidden container.
+    if (tab === 'charts') renderCharts();
+  }
+
+  const sessionOf = item => ({ ...item });
+
+  function rows() {
+    try {
+      // Accessing a throwing journal must land on the empty state, not escape.
+      const all = Array.isArray(journal?.history) ? journal.history.slice() : [];
+      const favoriteIds = new Set(Array.isArray(journal?.favorites) ? journal.favorites : []);
+      const filtered = all.filter(item => {
+        if (activeFilter === 'favorites') return favoriteIds.has(item.courseId);
+        if (activeFilter === 'completed') return item.completed === true;
+        return true;
+      });
+      return { filtered, favoriteIds, total: all.length };
+    } catch { return { filtered: [], favoriteIds: new Set(), total: 0 }; }
+  }
+
+  function renderList() {
+    try {
+      list.textContent = '';
+      const { filtered, favoriteIds, total } = rows();
+      if (!filtered.length) {
+        list.append(text('div', (total ? '当前筛选下没有记录。' : '还没有运行记录。开始一次刷课后会自动记录。'), 'ust-empty'));
+        return;
+      }
+      const fragment = doc.createDocumentFragment();
+      for (const item of filtered.slice(0, 200)) {
+        const row = text('div', '', 'ust-row');
+        row.dataset.courseId = item.courseId;
+        const star = text('button', favoriteIds.has(item.courseId) ? '★' : '☆', 'ust-star');
+        star.type = 'button';
+        star.setAttribute('aria-pressed', String(favoriteIds.has(item.courseId)));
+        star.setAttribute('aria-label', favoriteIds.has(item.courseId) ? '取消收藏' : '收藏该课程');
+        star.addEventListener('click', event => {
+          event.stopPropagation();
+          try {
+            const result = journal.toggleFavorite(item.courseId);
+            if (result.ok) renderList();
+          } catch { /* Favourites must never break the list. */ }
+        });
+        const main = text('div', '', 'ust-main');
+        const title = text('div', item.title || item.courseId, 'ust-title');
+        if (item.completed) title.append(text('span', '已完成', 'ust-badge ust-done'));
+        const minutes = Math.round((Number(item.duration) || 0) / 6000) / 10;
+        const when = item.startedAt ? new Date(item.startedAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知';
+        main.append(title, text('div', `${when} · ${minutes.toFixed(minutes < 10 ? 1 : 0)} 分钟${item.topicTitle ? ' · ' + item.topicTitle : ''}`, 'ust-meta'));
+        if (typeof onPickCourse === 'function') {
+          main.addEventListener('click', () => { try { onPickCourse(sessionOf(item)); } catch { /* Optional hook. */ } });
+          main.style.cursor = 'pointer';
+        }
+        row.append(star, main);
+        fragment.append(row);
+      }
+      list.append(fragment);
+      if (filtered.length > 200) list.append(text('div', `仅显示最近 200 条，共 ${filtered.length} 条。导出 CSV 可获取全部。`, 'ust-empty'));
+    } catch { /* A render failure leaves the previous list in place. */ }
+  }
+
+  function renderCharts() {
+    try {
+      chartsView.textContent = '';
+      const summary = journal?.summary?.();
+      const built = charts ? charts({ summary }) : null;
+      if (built?.root) chartsView.append(built.root);
+    } catch { chartsView.textContent = ''; }
+  }
+
+  exportButton.addEventListener('click', () => {
+    try {
+      const csv = journal?.toCsv?.() || '';
+      if (!csv) return;
+      // Resolve Blob/URL from the page realm so stubs and CSP shims that live
+      // on the window are honoured instead of an unrelated global scope.
+      const view = doc.defaultView || globalThis;
+      // BOM keeps Excel from mangling the Chinese headers; browsers ignore it.
+      const blob = new view.Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+      const url = view.URL.createObjectURL(blob);
+      const link = doc.createElement('a');
+      link.href = url;
+      link.download = `学习记录-${new Date().toISOString().slice(0, 10)}.csv`;
+      doc.body.append(link);
+      link.click();
+      link.remove();
+      view.setTimeout(() => view.URL.revokeObjectURL(url), 10_000);
+    } catch { /* Export is best-effort. */ }
+  });
+
+  clearButton.addEventListener('click', () => {
+    if (!doc.defaultView.confirm('清除本机保存的全部学习记录？收藏会保留。此操作不可撤销。')) return;
+    try { if (journal.clearHistory()) renderList(); } catch { /* Ignore. */ }
+  });
+
+  filter.addEventListener('change', () => { activeFilter = filter.value; renderList(); });
+
+  select('history');
+  renderList();
+
+  return {
+    root,
+    // Called by the business layer after a run finishes. Deliberately accepts
+    // loose input so the caller never has to guard its own call site.
+    record(entry) {
+      try {
+        if (journal.recordRun(entry)) { renderList(); if (activeTab === 'charts') renderCharts(); }
+      } catch { /* Recording is best-effort. */ }
+    },
+    refresh() { renderList(); renderCharts(); },
+    focusCharts() { select('charts'); renderCharts(); },
+  };
+}
+
 // Best-effort telemetry has its own native timer/request and never gates learning.
 function createUsageReporter(config, native) {
   let enabled = false, learning = false, code = '', browserId = '', sessionId = '', sequence = 0, epoch = 0;
@@ -895,10 +1420,13 @@ const setTimeout = licenseGate.setTimeout;
 const clearInterval = licenseGate.clearInterval;
 const clearTimeout = licenseGate.clearTimeout;
 const GM_xmlhttpRequest = licenseGate.request;
+
+const studyJournal = (() => { try { return createStudyJournal(LICENSE_CONFIG, { get: GM_getValue, set: GM_setValue }); } catch { return null; } })();
+const createStudyPanelSafe = (host) => { try { if (!studyJournal) return null; return createStudyPanel(document, { journal: studyJournal, charts: (options) => createStudyCharts(document, options) }); } catch { return null; } };
 (function () {
   'use strict';
 
-  const VERSION = '1.3.3';
+  const VERSION = '1.4.0';
   const API = {
     list: 'https://campus.chinaunicom.cn/training/app/themeColumn/getMyAreaInfoCourse',
     info: 'https://campus.chinaunicom.cn/training/app/course/info',
@@ -1192,6 +1720,15 @@ const GM_xmlhttpRequest = licenseGate.request;
       return;
     }
     readSettingsFromUI();
+    // Captured for the local study journal only; never sent anywhere.
+    const studyRunStartedAt = Date.now();
+    const studyRunCourses = new Map();
+    for (const topic of available) {
+      for (const course of Array.isArray(topic.courses) ? topic.courses : []) {
+        const id = String(course?.id ?? course?.courseId ?? '');
+        if (id && !studyRunCourses.has(id)) studyRunCourses.set(id, { title: course?.title || course?.name || '', topicTitle: topic.title || '', topicId: topic.id });
+      }
+    }
     overviewRun = true;
     state.running = true;
     state.stopping = false;
@@ -1308,6 +1845,25 @@ const GM_xmlhttpRequest = licenseGate.request;
       overviewRun = false;
       homeOverview?.setResumeAvailable?.(Boolean(overviewCheckpoint || overviewDraft));
       homeOverview?.setBusy(false);
+      // Local-only journal entry. Isolated so it can never affect run state.
+      try {
+        const panelApi = window.__ucpStudyPanel;
+        if (panelApi && studyRunCourses.size) {
+          const endedAt = Date.now();
+          const share = Math.max(1, Math.round((endedAt - studyRunStartedAt) / studyRunCourses.size));
+          let index = 0;
+          for (const [courseId, meta] of studyRunCourses) {
+            const completed = Number(state.done) >= Number(state.total) && Number(state.total) > 0;
+            panelApi.record({
+              courseId, title: meta.title, topicId: meta.topicId, topicTitle: meta.topicTitle,
+              startedAt: studyRunStartedAt + index * share,
+              endedAt: studyRunStartedAt + (index + 1) * share,
+              completed: completed && index === studyRunCourses.size - 1,
+            });
+            index++;
+          }
+        }
+      } catch { /* Journal is best-effort. */ }
     }
   }
   function mountHomeOverview() {
@@ -1347,6 +1903,19 @@ const GM_xmlhttpRequest = licenseGate.request;
     notice.id = 'ucp-overview-discovery-note';
     notice.textContent = '正在读取首页推荐专题入口；不会开始学习任务。';
     host.append(notice);
+    // Local study journal is strictly additive: mounted in its own try/catch so
+    // a failure hides this panel and leaves discovery, scanning and runs intact.
+    try {
+      const studyHost = document.createElement('div');
+      studyHost.id = 'ucp-study-panel';
+      const studyPanel = typeof createStudyPanelSafe === 'function' ? createStudyPanelSafe(studyHost) : null;
+      if (studyPanel) {
+        studyHost.append(studyPanel.root);
+        host.append(studyHost);
+        window.__ucpStudyPanel = studyPanel;
+        window.__ucpStudyJournal = typeof studyJournal === 'object' ? studyJournal : null;
+      }
+    } catch { /* The journal is optional; never surface this to the run path. */ }
     overviewDiscoveryError = '';
     overviewDiscovery = (async () => {
       try {
