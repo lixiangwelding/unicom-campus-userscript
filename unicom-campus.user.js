@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         联通党校刷课助手｜全站汇总·专题多选·断点续跑·进度统计·记录导出
+// @name         联通党校刷课助手｜一键批量刷课·多课并行·随停随续，省时省心，解放双手
 // @namespace    codex.local/unicom-campus-personal
-// @version      1.4.2
+// @version      1.4.3
 // @description  全站课程汇总、专题/课程多选、断点续跑、官方进度回读与统计图表；本地学习记录支持日期筛选、收藏、趋势分析及CSV导出。预览与教程免费，课程功能需激活，每码最多4个浏览器配置。
 // @author       Personal
 // @match        *://*.campus.chinaunicom.cn/*
@@ -26,7 +26,7 @@
 const LICENSE_CONFIG = {
   "apiBase": "https://license.ddtgm.cn",
   "shopUrl": "https://wzyp.cn/shop/2U92NO5U/nh6hd3",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "tutorialScreenshots": [
     {
       "title": "1. 选择全量汇总或专题优先（8 维统计卡片与实时进度同屏）",
@@ -1678,7 +1678,7 @@ const createStudyPanelSafe = (host, extra = {}) => { try { if (!studyJournal) re
 (function () {
   'use strict';
 
-  const VERSION = '1.4.2';
+  const VERSION = '1.4.3';
   const API = {
     list: 'https://campus.chinaunicom.cn/training/app/themeColumn/getMyAreaInfoCourse',
     info: 'https://campus.chinaunicom.cn/training/app/course/info',
